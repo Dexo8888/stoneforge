@@ -1,0 +1,64 @@
+---
+interface Props {
+  date: Date;
+  updatedDate?: Date;
+  author: { name: string; url?: string; avatar?: string };
+  /** Pass the raw body text to compute reading time. */
+  body?: string;
+}
+
+const { date, updatedDate, author, body } = Astro.props;
+
+const readingTime = body
+  ? Math.max(1, Math.round(body.split(/\s+/).length / 238))
+  : undefined;
+
+const formatter = new Intl.DateTimeFormat('en-US', {
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+});
+---
+
+<div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-[13px] text-[var(--site-text-tertiary)]">
+  <!-- Author -->
+  <span class="inline-flex items-center gap-1.5">
+    {author.avatar ? (
+      <img src={author.avatar} alt="" width="20" height="20" class="rounded-full object-cover" />
+    ) : (
+      <span class="flex items-center justify-center w-5 h-5 rounded-full bg-[var(--site-accent-subtle)] border border-[var(--site-border-accent)]/30 text-[10px] font-semibold text-[var(--site-accent)]">
+        {author.name.charAt(0)}
+      </span>
+    )}
+    {author.url ? (
+      <a href={author.url} target="_blank" rel="noopener noreferrer" class="hover:text-[var(--site-accent)] transition-colors">
+        {author.name}
+      </a>
+    ) : (
+      <span>{author.name}</span>
+    )}
+  </span>
+
+  <span class="text-[var(--site-text-ghost)]">&middot;</span>
+
+  <!-- Date -->
+  <time datetime={date.toISOString()}>
+    {formatter.format(date)}
+  </time>
+
+  {updatedDate && (
+    <>
+      <span class="text-[var(--site-text-ghost)]">&middot;</span>
+      <span>
+        Updated <time datetime={updatedDate.toISOString()}>{formatter.format(updatedDate)}</time>
+      </span>
+    </>
+  )}
+
+  {readingTime && (
+    <>
+      <span class="text-[var(--site-text-ghost)]">&middot;</span>
+      <span>{readingTime} min read</span>
+    </>
+  )}
+</div>

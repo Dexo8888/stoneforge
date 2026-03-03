@@ -1,0 +1,471 @@
+---
+title: "How Stoneforge Actually Works: A Deep Dive"
+description: "A technical walkthrough of Stoneforge's orchestration, worktree isolation, event sourcing, dependency graph, and more."
+date: 2026-03-02
+updatedDate: 2026-03-02
+tags: ["stoneforge", "architecture", "multi-agent", "deep-dive"]
+---
+
+import ImagePlaceholder from '../../components/blog/ImagePlaceholder.astro';
+
+The [intro post](/blog/introducing-stoneforge-blog/) covers what Stoneforge is and why it exists. This post goes deeper into every major system: the orchestration loop, worktree isolation, the dependency graph, event sourcing, the messaging layer, the document system, workflows, stewards, custom prompts, multi-provider support, and the design tradeoffs behind each.
+
+If you're evaluating whether to adopt Stoneforge or want to understand how a multi-agent orchestration system works under the hood, this is the reference.
+
+<ImagePlaceholder
+  alt="The stoneforge workshop — multiple artisan benches with individual forges, a central furnace, industrious and organized"
+  prompt="Wide-angle establishing shot of a stoneforge workshop carved into the interior of a granite mountain. The space is a tall, cathedral-like cavern with rough-hewn stone walls and a vaulted ceiling disappearing into shadow. A massive central furnace, built from blackened iron and mortared stone, sits at the back of the cavern. Its mouth glows deep orange, casting long warm light across the entire floor. Visible heat distortion ripples above it. Five individual workbenches are arranged in a fan pattern facing the central furnace, each one a heavy stone slab on iron legs. Each bench has its own smaller forge — a waist-high brick kiln with bellows attached — glowing at different intensities from cherry red to white-hot. At three of the five benches, artisans are actively working. The leftmost artisan is a broad-shouldered figure in a heavy leather apron, pressing a heated slab of pale grey stone into a curved mould, the stone glowing dull orange at the edges where heat still lingers. The center artisan bends over their bench with a long-handled shaping tool, smoothing a section of warm stone that has the soft, yielding surface of just-heated material. The rightmost artisan holds a block up to eye level, inspecting its curvature against a carved wooden template. Two benches are empty but prepared: tools laid out in order, forges lit and waiting. The floor is worn flagstone, darkened by decades of forge-dust. Iron tool racks line the walls between benches, holding tongs, moulds, calipers, and shaping bars in organized rows. Warm amber and orange lighting dominates, with cool blue-grey stone visible in the upper walls and ceiling where the forge-light fades. Style: detailed fantasy illustration, the aesthetic of a Studio Ghibli workshop crossed with a medieval illuminated manuscript. Rich textures on stone and metal surfaces. Muted earth tones — umber, sienna, slate grey — with vivid orange-amber forge accents. Wide 16:9 aspect ratio. No text anywhere in the image."
+/>
+
+## When do you actually need this?
+
+Not everyone does. If you're running one Claude Code or Codex instance at a time, coordination isn't a problem. The problems show up when you run three or more agents on the same codebase simultaneously.
+
+You're manually splitting work across terminals. You're keeping a mental model of who's doing what. An agent has undone another agent's work because they were both editing the same file. You've waited 20 minutes for one agent to finish a blocking task before starting the next one. You're copying context between agent sessions because they can't see each other's progress.
+
+If that sounds familiar, you're doing multi-agent coordination by hand. Stoneforge automates it.
+
+## The orchestration loop
+
+Everything starts with a goal. You tell the Director "build an authentication system" or "refactor the payments module to use Stripe." The Director is a persistent agent session that acts as your strategic planner. It doesn't write code. It decomposes your goal into a plan.
+
+A plan is a set of tasks with priorities (1 through 5, where 1 is critical) and dependency relationships. The Director might break "build authentication" into:
+
+1. Design the API schema (priority 1, no dependencies)
+2. Implement OAuth endpoints (priority 2, blocked by task 1)
+3. Build the login UI (priority 2, blocked by task 1)
+4. Write integration tests (priority 3, blocked by tasks 2 and 3)
+
+Plans start in draft status. While a plan is in draft, its tasks are invisible to the dispatch system. This prevents a race condition where the daemon assigns a task before the Director has finished wiring dependency relationships. Once the Director activates the plan, tasks become dispatchable.
+
+<ImagePlaceholder
+  alt="The Director's blueprint table — tasks as stone tokens connected by dependency lines, lit by candlelight and forge glow"
+  prompt="Three-quarter overhead view, looking down at roughly 60 degrees onto a large rectangular stone table in a quiet chamber off the main forge floor. The table surface is a single slab of polished dark basalt, about 6 feet by 4 feet. On the table: a detailed architectural blueprint is etched directly into the stone surface in thin white chalk lines, showing the floor plan of a building decomposed into sections. Scattered across the blueprint are small stone tokens — flat, round discs about the size of a coin, each a different color. Four red tokens are clustered at the top of the plan (high priority), three yellow tokens sit in the middle rows (medium priority), and two grey tokens rest at the bottom (low priority). Thin copper wires physically connect certain tokens to each other, pulled taut across the table surface, representing dependency chains. Some wires run from red tokens down to yellow ones (blocking). One yellow token has three wires converging on it from above, showing it depends on three upstream tasks. A single token at the far left sits isolated with no wires — the independent starting task. The Director stands at the head of the table, visible from the chest up. They are an older figure with sharp, attentive eyes, wearing a long slate-grey coat with no apron (they don't work the forge). Their hands rest on the table edge, one finger tracing a dependency wire between two tokens. They hold a thin chalk stylus in their other hand. On the table's near edge, a rolled parchment (the plan in draft) sits with a stone paperweight shaped like a small anvil on top of it. Two thick candles in iron holders light the table from the left. A warm orange glow from the main forge room spills through a doorway in the background, out of focus. Style: detailed fantasy illustration, slightly desaturated palette — slate, charcoal, chalk white, copper wire highlights, warm candle-yellow on the Director's face and hands. Eye-level with the table surface so the tokens and wires are clearly readable. 16:9 aspect ratio. No text in the image."
+/>
+
+The dispatch daemon is a background process that polls every 5 seconds. Each cycle runs five phases in strict order:
+
+1. **Orphan recovery** checks for workers with assigned tasks but no active session (happens after server restarts)
+2. **Inbox polling** routes messages to agents and spawns triage sessions for accumulated notifications
+3. **Steward trigger polling** fires cron-scheduled or event-triggered steward workflows
+4. **Workflow task polling** assigns workflow step tasks to available stewards
+5. **Closed-unmerged reconciliation** catches tasks stuck at "closed" without being merged (a 2-minute grace period prevents false positives from in-progress merge sequences)
+
+The worker availability check runs within this cycle too. It finds unblocked tasks with no assignee, matches them to idle workers, and dispatches the highest-priority ready task to the next available worker.
+
+Priority sorting goes beyond the number on the task. The daemon walks upstream dependencies to calculate effective priority. If five other tasks are blocked waiting on task A, task A gets bumped up in the queue even if its explicit priority is lower. The traversal goes up to 10 levels deep and considers the minimum (most urgent) priority across all dependents.
+
+```
+    You ──── "Build feature X" ────▶ Director
+                                        │
+                                   breaks goal into
+                                   prioritized tasks
+                                        │
+                                        ▼
+                                  ┌────────────┐
+                                  │ Task Pool   │ ◀── priorities + dependencies
+                                  └─────┬───────┘
+                                        │
+                              dispatch daemon assigns
+                              ready tasks to idle workers
+                                        │
+                        ┌───────────────┼────────────────┐
+                        ▼               ▼                ▼
+                  ┌───────────┐   ┌───────────┐    ┌───────────┐
+                  │  Worker 1 │   │  Worker 2 │    │  Worker 3 │
+                  │ (worktree)│   │ (worktree)│    │ (worktree)│
+                  └─────┬─────┘   └─────┬─────┘    └─────┬─────┘
+                        │               │                │
+                  commit & push   commit & push    commit & push
+                        │               │                │
+                        └───────────────┼────────────────┘
+                                        ▼
+                                ┌───────────────┐
+                                │ Merge Steward │
+                                └───────┬───────┘
+                                        │
+                          tests pass? → squash-merge to main
+                          tests fail? → create fix task, re-queue
+```
+
+Workers are ephemeral by default. They spawn, execute one task, commit and push their work, then exit. The daemon picks up the next ready task and assigns it to the next idle worker. The loop repeats until the plan is complete.
+
+## The task lifecycle
+
+A task moves through eight possible statuses. Understanding these helps you read the dashboard and debug stuck plans.
+
+**Open** is the starting state. The task exists and is available for assignment. **In progress** means a worker is actively on it. **Blocked** is automatic: Stoneforge transitions a task to blocked when a dependency is added whose blocker hasn't completed yet, and transitions it back when the blocker closes. The system saves the previous status so it can restore it after unblocking. **Backlog** is for tasks that need triage before they're ready for work. **Deferred** is for tasks deliberately postponed. **Review** means the worker finished and the task is waiting for the merge steward to run tests and merge. **Closed** means done and merged. **Tombstone** is a soft delete.
+
+The dispatch daemon's `ready()` query filters for tasks that are open or in progress, not in the blocked cache, not in a draft or blocked plan, not scheduled for a future date, and not part of an ephemeral workflow. Everything else is invisible to dispatch.
+
+## The dependency graph
+
+Dependencies in Stoneforge do more than link tasks. The system supports several dependency types, and only some participate in blocking.
+
+**Blocking dependencies** prevent work from starting:
+
+The `blocks` type is straightforward. Task A blocks task B, so B can't start until A closes. The `parent-child` type creates containment hierarchies. Tasks belong to plans via parent-child dependencies, and libraries contain documents the same way. Blocking is transitive: if a plan is blocked, all its child tasks are blocked too. The `awaits` type handles external gates. A task might await a timer (wait until a specific date), an approval (wait for specific people to sign off), an external system event, or a webhook callback.
+
+**Non-blocking dependencies** capture relationships without preventing work:
+
+`relates-to` creates bidirectional associations. `references` is a unidirectional citation. `supersedes` chains version history. `duplicates` marks duplicate tasks. `caused-by` links a bug fix to the bug that caused it. `validates` links a test task to what it tests. None of these prevent dispatch.
+
+<ImagePlaceholder
+  alt="The dependency web — glowing threads between stone blocks, taut bright threads for blockers, loose dim threads for associations"
+  prompt="Extreme close-up of a workbench surface, shot from slightly above, showing nine small stone blocks arranged in a network pattern. The blocks are rough cubes, each about 3 inches across, carved from different types of stone. Three blocks in the top row are dark granite (completed tasks — they have a faint green glow at their edges). Four blocks in the middle row are warm sandstone (active tasks — they pulse with a soft amber inner light). Two blocks at the bottom are pale limestone (blocked tasks — they look inert and cold). Between the blocks, two types of threads are visible. The blocking dependencies are taut, bright amber filaments that glow like heated wire, pulled perfectly straight between blocks, casting tiny warm highlights on the bench surface beneath them. Three amber threads descend from the top-row granite blocks down to middle-row sandstone blocks, showing the completed work that unblocked them. Two amber threads connect middle-row blocks to bottom-row limestone blocks, showing why the limestone blocks remain cold and inert — their blockers haven't finished yet. The non-blocking associations are loose, translucent silver threads that drape in gentle catenary curves between blocks, barely visible, more like spider silk than wire. These silver threads connect blocks laterally — a sandstone block to another sandstone block, a granite block back to a limestone block — showing 'relates-to' and 'references' links that don't prevent work. An artisan's left hand enters the frame from the bottom-left corner, fingertips just touching one of the amber threads as if testing its tension. The hand is weathered, with forge calluses. The bench surface is scored dark wood with a visible grain. A single forge light source comes from the upper left, casting the threads' shadows onto the bench. Style: macro-photography feel rendered as fantasy illustration. Extremely sharp focus on the threads and blocks, with the hand and bench edges falling into shallow depth-of-field blur. Warm amber and cool silver color contrast. Dark background. 16:9 aspect ratio. No text."
+/>
+
+### The blocked cache
+
+Computing "is this task blocked?" by traversing the dependency graph on every poll cycle would be expensive. Stoneforge maintains a materialized view called the blocked cache. It's a SQLite table storing every currently-blocked element along with what's blocking it and the element's previous status.
+
+When a dependency is added or a task's status changes, the cache invalidates and recomputes. When a blocker closes, the cache removes the blocked entry and triggers a status callback that restores the element's previous status. The invalidation cascades through parent-child hierarchies so transitive blocking stays correct.
+
+The cache supports cycle detection via BFS traversal. Before adding a blocking dependency, you can call `detectCycle()` to check whether the new edge would create a circular dependency. The traversal goes up to 100 levels deep and returns the cycle path if one is found.
+
+### Awaits gates
+
+Gates are the interesting part of the dependency graph. A task can await different types of external conditions:
+
+**Timer gates** block until a specified timestamp. Useful for scheduled releases or cooldown periods. Satisfaction is checked automatically: `now >= waitUntil`.
+
+**Approval gates** require sign-off from specific entities. You configure which approvers are required and how many must approve (defaults to all). Approvals are recorded individually and the gate opens when the threshold is met.
+
+**External gates** and **webhook gates** represent events from outside Stoneforge. A CI/CD pipeline completing, a deployment finishing, a third-party API responding. You mark these satisfied manually via `sf dependency satisfy` or programmatically via the API. Once satisfied, the blocked task unblocks and enters the dispatch queue.
+
+## Worktree isolation
+
+This is the most important architectural decision in Stoneforge. Every worker gets its own [git worktree](https://git-scm.com/docs/git-worktree).
+
+A worktree is a separate working directory linked to the same git repository. Each one can have a different branch checked out at the same time. Worker 1 might be editing `src/auth.ts` on `task/abc-oauth` while Worker 2 edits the same file on `task/def-api-routes`. They never interfere because they're in physically separate directories on disk.
+
+```
+your-project/
+├── .stoneforge/.worktrees/
+│   ├── worker-1/task-abc-oauth/          ← branch: task/abc-oauth
+│   │   └── src/auth.ts  (worker 1's copy)
+│   ├── worker-2/task-def-api-routes/     ← branch: task/def-api-routes
+│   │   └── src/auth.ts  (worker 2's copy)
+│   └── worker-3/task-ghi-login-ui/       ← branch: task/ghi-login-ui
+│       └── src/components/Login.tsx
+└── src/                                   ← main branch (untouched)
+    └── auth.ts
+```
+
+<ImagePlaceholder
+  alt="Three separate benches around a shared quarry — each artisan shapes their own copy of the source stone independently"
+  prompt="Directly overhead bird's-eye view looking straight down into a circular stoneforge chamber. At the exact center, a deep quarry pit is cut into the floor, roughly 8 feet across. At the bottom of the pit, partially visible, sits the source stone — a large, untouched block of pale marble, pristine and unworked. It glows faintly with a cool white light, indicating it is the canonical original. Radiating outward from the quarry pit, three separate workbenches are arranged at equal 120-degree intervals, like the spokes of a wheel. Each bench is a complete, self-contained workstation. BENCH ONE (top of image): An artisan in a rust-colored apron works a block of marble that is an exact copy of the source stone below, but this copy has its left face fully shaped into a smooth curved wall section. The right face is still rough. Their personal forge kiln glows hot beside them. A tidy row of shaping tools lines the bench edge. BENCH TWO (bottom-left): A different artisan in a dark green apron works another copy of the same source stone, but this one has a completely different section shaped — the top has been moulded into an arch form while the sides remain untouched. Their forge and tools are arranged differently from bench one. BENCH THREE (bottom-right): A third artisan in a blue-grey apron works a third copy. This one is the most complete — nearly the entire block has been shaped into a finished architectural column section. Their forge has cooled slightly (dimmer glow), suggesting they're in the final smoothing stages. Critical visual detail: from each of the three working copies, a thin luminous golden line runs across the floor, down the lip of the quarry pit, and connects to the source stone at the bottom. These three lines are the link back to the original. The three artisans face away from each other, each focused entirely on their own bench. They cannot see each other's work. Stone dividing walls about 4 feet high separate each bench bay, reinforcing the isolation. The floor is concentric rings of laid flagstone, darker near the pit and lighter at the edges. Each forge casts its own warm pool of orange light around its bench. The spaces between benches are in cooler shadow. Style: detailed fantasy illustration, top-down orthographic perspective like an architectural floor plan come to life. Clean, readable composition with the three benches clearly separated. Earth tones — warm sienna, slate, marble white — with golden connection lines as the visual anchor. 1:1 square aspect ratio. No text."
+/>
+
+When a worker pushes, it pushes its own branch. The main branch is never modified directly by a worker. Merging is the steward's job.
+
+Worktree paths are deterministic: `agent/{worker-name}/{task-id}-{slug}`. When a task is handed off to a different worker, the new worker resumes in the same worktree on the same branch, picking up exactly where the last worker left off.
+
+Worktrees are created with `git worktree add --no-checkout` followed by `git switch -c` to avoid triggering pre-checkout hooks or build processes during creation. This matters in monorepos where checkout hooks might run expensive operations.
+
+One gotcha worth knowing: if you're using Turborepo, fresh worktrees require `turbo build --force`. Turbo's shared cache can restore build outputs to the wrong worktree path. Stoneforge handles this internally, but it helps to know if you're debugging build issues.
+
+## Two databases, one source of truth
+
+Stoneforge stores everything twice. Every task, document, message, dependency, and agent action is recorded in both JSONL files and a SQLite database. These aren't redundant copies. They serve different purposes.
+
+**JSONL is the source of truth.** Every state change is appended as an immutable record to `.stoneforge/sync/elements.jsonl`. These files are text, line-based, and designed to be committed to git. You can diff them, merge them across branches, and read them with any text editor.
+
+```jsonl
+{"type":"element","id":"el-abc123","elementType":"task","title":"Implement OAuth","status":"open","priority":1,"createdBy":"director-1","createdAt":"2026-03-02T10:00:00.000Z"}
+{"type":"element","id":"el-abc123","elementType":"task","title":"Implement OAuth","status":"in_progress","priority":1,"assignee":"worker-1","updatedAt":"2026-03-02T10:05:00.000Z"}
+{"type":"element","id":"el-abc123","elementType":"task","title":"Implement OAuth","status":"closed","priority":1,"assignee":"worker-1","updatedAt":"2026-03-02T11:30:00.000Z"}
+```
+
+Dependencies are stored in a separate file, `.stoneforge/sync/dependencies.jsonl`, with the same append-only structure.
+
+**SQLite is the cache.** It provides indexed queries, FTS5 full-text search across documents, the blocked cache for dependency resolution, and sub-millisecond lookups that would be impractical against flat files. But it's entirely disposable. Delete the `.db` file and run `sf sync import`. The system rebuilds from the JSONL records.
+
+Why not just use SQLite? Binary files don't diff. They don't merge across git branches. If the file corrupts (and with multiple agents writing concurrently, that's a real risk), you lose everything.
+
+Why not just use JSONL? Scanning a flat file for a single task by ID is slow once you have thousands of records. Full-text search requires indexes. Dependency graph traversal requires joins.
+
+The dual model gives you append-only durability with query performance.
+
+<ImagePlaceholder
+  alt="The dual record system — permanent wall-carvings deep in the quarry (JSONL) and expendable clay tablets at the entrance (SQLite)"
+  prompt="A single wide image divided into two distinct zones by a natural stone archway in the center, as if the viewer is standing in the archway looking both directions at once. LEFT SIDE — THE DEEP QUARRY (the Ledger of Stone): A long, narrow underground corridor recedes into the distance. Both walls are covered floor to ceiling with rows of carved inscriptions — thin, precise lines of text chiseled directly into the blue-grey granite. The inscriptions are organized in perfectly horizontal rows, each row a single record, extending hundreds of rows deep along the corridor. The carvings are permanent — some rows are visibly older, their edges slightly worn but still fully legible. No inscription has been scratched out or modified; where corrections exist, a new line is carved immediately below the original. The corridor is lit by a row of small, steady flame sconces mounted at regular intervals, casting even, warm yellow light across the carved text. The overall feeling is of permanence, depth, and careful order. At the far end of the corridor, a faint point of light suggests the passage continues much further. RIGHT SIDE — THE QUARRY ENTRANCE (the Quick-Reference Tablets): A brighter, more open space near daylight. A large wooden work table dominates the area, its surface covered with stacked clay tablets about the size of paperback books. Some tablets are arranged in neat, indexed stacks. Others are scattered across the workspace in active use. A young keeper sits at the table, holding one tablet in their left hand while rapidly pressing notes into a fresh clay tablet with a stylus in their right hand — they are rebuilding a tablet from memory of the wall carvings. A small pile of broken and discarded tablets sits in a waste bin beside the table, clearly showing these are expendable. Through a wide entrance behind the keeper, natural daylight floods in, illuminating dust motes in the air. The light outside is overcast white, contrasting with the warm underground sconce-light on the left side. CONNECTING DETAIL: On the floor of the stone archway separating the two zones, a simple mosaic arrow pattern points from the deep corridor (left) toward the tablet table (right), indicating the flow of truth — the tablets are derived from the wall carvings, never the reverse. Style: detailed fantasy illustration, wide 16:9 panoramic composition. Cool blue-grey stone dominates the left, warm daylight-and-clay tones dominate the right. The archway in the center creates a natural visual divider. Atmospheric perspective — the left corridor fades into depth, the right side is sharp and bright. No text in the image."
+/>
+
+### Sync conflict resolution
+
+When JSONL files are merged across git branches, conflicts are resolved with a last-write-wins strategy plus several special cases. Content hash comparison (SHA256, excluding timestamps and sync metadata) detects identical changes. Tags always merge as a union, so you never lose tags during sync. Closed status is sticky: if one side closed a task, the closed version wins regardless of timestamp. Fresh tombstones (within a 30-day TTL) win over live elements. For dependencies, removal is authoritative: if one side deleted a dependency, it stays deleted.
+
+The content hash computation strips `metadata._externalSync` fields before hashing. Without this, every push to an external provider would update the sync metadata, change the hash, mark the element dirty, and trigger another push. The stripping breaks the feedback loop.
+
+### The event audit trail
+
+Every mutation records the actor and timestamp. If you need to debug a task in a weird state:
+
+```bash
+sf task events el-abc123
+```
+
+Worker 1 was assigned at 10:05. It handed off at 10:45 with notes about a CORS issue. Worker 2 picked it up at 10:50. It completed at 11:30. The merge steward squash-merged at 11:32. Tests passed. Every step is attributed and timestamped.
+
+## The merge steward
+
+When a worker finishes a task, it commits, pushes, and marks the task as ready for review. The merge steward picks it up.
+
+The steward runs in a temporary detached worktree. It never touches the main repository's working directory or HEAD. The process:
+
+1. Create a temporary worktree checked out at `origin/main` (or whatever your target branch is)
+2. Squash-merge the worker's branch into the temporary worktree
+3. If there's a merge conflict, stop and create a fix task for the next available worker
+4. If the merge succeeds, run the configured test command
+5. Tests pass? Push the merged commit to the target branch and clean up
+6. Tests fail? Create a fix task with the failure output attached
+
+The temporary worktree approach means the main repo is never locked during merges. Multiple stewards can process different branches at the same time. An optimistic locking mechanism using merge status transitions (pending → testing → merging → merged) prevents two stewards from claiming the same task. If a steward tries to transition a task that another steward already claimed, it gets a `MergeStatusConflictError` and backs off.
+
+<ImagePlaceholder
+  alt="The Merge Steward at the inspection bench — fitting stone pieces together, testing tools at hand, rejected pieces set aside with notes"
+  prompt="Medium shot of a Merge Steward artisan at a raised inspection bench in a separate, quieter alcove off the main forge floor. The bench is elevated on a stone platform, about 18 inches higher than the main workshop floor, giving the Steward a slightly elevated position. The Steward is a focused, precise figure wearing a clean leather apron — lighter and less scorched than the workers' aprons — with a magnifying loupe pushed up onto their forehead. Both hands grip a shaped stone piece, holding it at a careful angle against a second piece already fixed to the bench surface. The two pieces are being trial-fitted: one piece (from a worker's bench) still has a faint warm orange glow at its interior, the residual heat of recent forging. The other piece (the existing main assembly) is cool and grey. The Steward studies the seam line where the two pieces meet, eyes narrowed, checking for gaps. On the bench surface to the Steward's right, a precise row of testing instruments: a brass spirit level, a plumb bob hanging from a small tripod stand, iron calipers opened to a specific measurement, and a straight-edge ruler marked with engraved increments. Behind the Steward, a wooden cooling rack holds four successfully joined stone assemblies, each progressively larger — showing how individual pieces accumulate into a growing whole structure. The nearest assembly is a simple two-piece join. The farthest is a complex eight-piece section of a curved wall, all seams invisible. To the Steward's left, slightly apart from the main work area, one rejected stone piece sits on a low shelf with a curled parchment note tied to it with twine. The note is visible but its text is not legible — it's clearly the Steward's feedback to the worker. A second rejected piece leans against the wall behind the shelf. The alcove is lit from above by a single large oil lamp on a chain, casting a pool of focused, warm white light directly on the inspection surface. The main forge floor is visible through a wide doorway in the background, out of focus, with the amber glow of multiple forges and the silhouettes of workers. Style: detailed fantasy illustration with the visual clarity of a Norman Rockwell workshop scene translated into a fantasy medieval setting. Warm neutral palette — tawny leather, brass, grey stone, warm lamplight. Tight composition focused on the Steward's hands and the seam being inspected. 16:9 aspect ratio. No text."
+/>
+
+After the push, the steward fast-forwards the local target branch with `git merge --ff-only`. If that fails (someone else pushed in the meantime), it fetches and retries.
+
+You can configure the merge strategy (squash or regular merge), auto-push, branch deletion after merge, and the test command with its timeout. Defaults are squash-merge, auto-push, auto-delete, and `npm test` with a 5-minute timeout.
+
+## The four steward types
+
+The merge steward is the most visible, but Stoneforge runs four types, each with a distinct responsibility.
+
+**Merge stewards** handle branch integration as described above. They watch for tasks entering review status and process them automatically.
+
+**Docs stewards** scan documentation for accuracy. They verify that file paths referenced in docs actually exist, that internal markdown links resolve, that documented CLI commands match the actual command surface, and that TypeScript type documentation matches the source. When they find issues, they create a worktree, apply fixes, commit, and squash-merge back. Six verification categories run in parallel: file paths, internal links, exports, CLI commands, type fields, and API methods.
+
+**Recovery stewards** handle tasks stuck in broken states: assigned but with no active session, closed but never merged, stuck in progress with no recent activity. They diagnose the issue and either restart the work, create a recovery task, or roll back cleanly.
+
+**Custom stewards** are user-defined. You register a steward with `--focus custom`, attach a playbook (inline or as a reference to a workflow template), and configure triggers. The steward executes your playbook when triggered.
+
+### Triggers: cron and events
+
+Any steward can be triggered by a cron schedule, by a system event, or both.
+
+Cron triggers use standard 5-field cron expressions. `0 3 * * *` fires at 3 AM daily. `*/5 * * * *` fires every 5 minutes. The scheduler parses the expression, calculates the next matching time, and sets a `setTimeout` to fire. After execution, it recalculates and reschedules.
+
+Event triggers fire on specific system events. You can attach a condition expression that filters which events match. If a custom steward's trigger is configured as `event: 'task_closed', condition: "task.tags.includes('cleanup-needed')"`, it only fires when a task with that tag closes. Conditions are evaluated in a strict sandbox with safe token validation.
+
+Steward sessions have safety limits. An idle timeout (default 2 minutes) terminates stewards that stop producing output. A max duration timeout (default 30 minutes) prevents runaway sessions. Both are checked every 30 seconds. The scheduler also prevents overlapping executions: if a cron-triggered steward is still running when the next cron fires, the execution is skipped.
+
+## When things go wrong
+
+Agents fail. They hit context window limits. They get stuck. API rate limits kick in. The system handles all of this without losing work.
+
+### Handoffs
+
+When a worker can't finish a task, it hands off. The worker commits and pushes whatever it has, appends a note to the task description explaining where it left off and what remains, unassigns itself, and exits.
+
+The handoff preserves the branch name and worktree path in the task metadata. When the dispatch daemon assigns the task to the next worker, that worker resumes on the same branch in the same directory. It sees all the previous commits. It reads the handoff notes. It picks up where the last worker stopped.
+
+Handoff history accumulates on the task as an array of entries, each recording the session ID, handoff message, branch name, and timestamp. If a task goes through three workers, you can trace what each one did, why each one stopped, and where each one left off.
+
+<ImagePlaceholder
+  alt="The Passing of the Chisel — one artisan steps away from a half-finished stone, handoff note secured on the bench, another artisan approaching"
+  prompt="Two-figure composition at a single workbench, captured at the exact moment of transition between workers. LEFT FIGURE (the departing worker): An artisan is mid-step away from the bench, their body turned three-quarters away from the viewer. They have just set down their shaping tools — a chisel and a curved moulding bar — arranged neatly parallel to each other on the bench edge, handles toward the next worker. Their hands are open at their sides, palms visible, fingers slightly spread — the posture of someone who has deliberately released their grip. Their leather apron shows fresh forge-dust. They are looking back over their shoulder at the bench, not at the approaching figure, as if taking one last mental note of where things stand. THE BENCH: The stone block sitting on the bench is precisely half-finished. The left half is beautifully shaped — a smooth curved surface with the clean, flowing lines that only forged (not carved) stone can achieve. The right half is rough and unshaped, the raw heated surface cooled mid-work, its dull surface contrasting sharply with the polished left side. The boundary between finished and unfinished runs diagonally across the block. Prominently placed in the center of the bench, between the tools and the stone, is a rolled parchment note secured under a small iron anvil-shaped paperweight. The parchment is partially unrolled, showing dense handwritten lines — the handoff note. The personal forge beside the bench is banked but not extinguished: coals still glow faintly orange under a layer of ash, ready to be stoked back to working temperature. RIGHT FIGURE (the arriving worker): A second artisan approaches from the right side of the frame, about four steps from the bench. They are in mid-stride, leaning slightly forward with intent. They carry their own shaping tools in a leather roll tucked under one arm. Their apron is clean — they haven't worked this stone yet. Their eyes are fixed on the parchment note on the bench, already reading before they've arrived. A narrow corridor connects the bench to the main forge floor in the background, where other benches with working artisans are visible as warm, blurred shapes. LIGHTING: Strong warm side-light from the left (the bench's personal forge), creating long shadows across the bench surface. The departing worker is half in light, half in shadow. The arriving worker is lit from behind by the main forge glow, creating a subtle rim light on their silhouette. Style: detailed fantasy illustration with cinematic composition — the two figures framing the bench between them like a visual handshake. Warm earth tones — umber, sienna, iron grey — with the half-finished stone as the focal point. The mood is deliberate and respectful, not rushed. 16:9 aspect ratio. No text."
+/>
+
+### Orphan recovery
+
+If the Stoneforge server restarts (a deploy, a crash, dev mode hot-reload), workers mid-task become orphaned. They have assigned tasks but no active session.
+
+On startup, the daemon's first action is orphan recovery. For each orphaned worker, it tries to resume the previous session using the saved provider session ID. If that works, the worker continues where it was. If resume fails, the daemon spawns a fresh session on the same branch and worktree, giving the new session the full task context and handoff notes.
+
+The system tracks resume attempts per worker to prevent infinite retry loops. After three failed attempts, the task is left in review status as a safety valve.
+
+### Rate limiting
+
+When a worker session exits within seconds of starting (the threshold is 10 seconds), that usually means an API rate limit. The dispatch daemon detects this pattern and puts the worker on a one-hour cooldown. During cooldown, the worker is skipped during dispatch. The minimum floor for any rate limit cooldown is 15 minutes, even if the provider signals a shorter reset.
+
+Before spawning triage sessions, the daemon also checks rate limit status. If all configured executables for a steward are rate-limited, the triage spawn is deferred and messages stay unread until limits expire.
+
+## Agent pools and concurrency control
+
+Pools limit how many agents run simultaneously. This is useful for managing API costs, preventing machine resource exhaustion, or splitting agents across different provider plans.
+
+A pool has a `maxSize` (how many agents can run at once) and a list of `agentTypes` that specify which agents count against it. You can filter by role (worker vs steward), worker mode (ephemeral vs persistent), steward focus (merge, docs, recovery, custom), and provider.
+
+Before spawning any agent, the dispatch daemon checks all pools that govern that agent type. The agent must pass every governing pool's capacity check to spawn. If a pool is full, the daemon waits until a slot opens.
+
+Directors are never pool-managed. They're persistent sessions that stay running and don't compete for worker slots.
+
+## Messaging and channels
+
+Agents communicate through a channel-based messaging system. Every agent gets a dedicated direct channel at registration for dispatch notifications, triage messages, and agent-to-agent communication.
+
+Two channel types exist. **Direct channels** are 1:1, created between two entities. Their names are deterministic: sorted entity IDs joined with a colon, so the same pair always resolves to the same channel. Membership is immutable. **Group channels** support multiple members with configurable visibility (public or private) and join policy (open, invite-only, or request-based). Designated moderators control membership.
+
+Messages are immutable after creation. They can't be edited or deleted. Any attempt throws a `MessageImmutableError`. This gives you a reliable audit trail of all agent communication.
+
+Message content is stored as a separate Document element, referenced via `contentRef`. This keeps message metadata lean, supports large content without bloating the message table, and means message content is searchable through the same full-text search that indexes documents. Attachments are an array of Document IDs, up to 100 per message.
+
+Threading works through a `threadId` field. Root messages have `threadId: null`. Replies point to the root message's ID. You can retrieve entire threads with `sf message thread <msg-id>`.
+
+### Inbox and message routing
+
+The inbox service tracks unread messages per agent with three source types: `direct` (from a DM channel), `mention` (the agent was @mentioned), and `thread_reply` (someone replied to a thread the agent started). Items progress through three statuses: unread → read → archived.
+
+The dispatch daemon routes messages differently depending on the agent's role and session state:
+
+Dispatch messages (task assignments) are marked as read immediately. The actual session spawn is handled separately by worker availability polling.
+
+For ephemeral workers that are busy on a task, non-dispatch messages are left unread. Interrupting a focused task session would be counterproductive. When the worker finishes and becomes idle, the daemon spawns a **triage session**: a lightweight, read-only session where the agent processes accumulated messages. The daemon groups unread messages by channel, picks one channel, creates a temporary detached worktree, and spawns the agent with a triage prompt listing all pending messages. The agent can respond, create tasks, escalate to the Director, or acknowledge. Only one channel's messages are processed per triage session. Remaining channels are handled in subsequent poll cycles.
+
+For persistent workers and Directors with active sessions, messages are forwarded directly as user input. A duplicate guard using an in-flight tracking set prevents the same message from being forwarded twice if the polling cycle runs faster than the forwarding completes.
+
+## The document and knowledge base
+
+Documents in Stoneforge are versioned content elements. Each has a content type (text, markdown, or JSON), a category from a fixed taxonomy (spec, prd, decision-log, tutorial, reference, runbook, and several others), and an immutability flag that can lock a document against further edits.
+
+<ImagePlaceholder
+  alt="The guild archive — stone shelves of scrolls organized into labeled libraries, an artisan consulting the Documentation Directory at a reading desk"
+  prompt="Interior of a circular archive chamber carved from living rock, about 30 feet in diameter. The walls curve upward into a domed ceiling. Every inch of wall space, floor to ceiling, is fitted with stone shelving carved directly from the rock face. The shelves hold hundreds of scrolls and bound tablets organized into clearly delineated sections. SHELF ORGANIZATION: The shelves are grouped into visibly distinct library sections separated by carved stone dividers that protrude slightly from the wall. Each section has a carved header label above it on a small stone plaque: the left wall sections are labeled (in carved, aged lettering) 'SPECIFICATIONS', 'DECISION LOG', 'REFERENCES'. The back wall sections read 'TUTORIALS', 'RUNBOOKS', 'CHANGELOGS'. The right wall shows 'HOW-TO GUIDES', 'POST-MORTEMS'. Within each section, scrolls are filed vertically in slots like wine bottles. Bound stone tablets lean against each other in upright rows. Some scrolls are old and yellowed. Others are fresh parchment — these recently-updated scrolls have a faint warm glow at their edges, like a page just written on by candlelight, distinguishing new knowledge from old. A few shelf slots are empty with a small placeholder marker, indicating documents that have been checked out. CENTER OF THE ROOM: A large hexagonal reading desk made of dark walnut, its surface worn smooth from decades of use. An artisan sits at one face of the hexagon on a backless stone stool. Before them, spread open and weighted at the corners with small stone blocks, is the Documentation Directory — a large, oversized scroll roughly 3 feet wide when unrolled, densely covered in organized columns of text listing every document in the archive with its section, shelf location, and a one-line description. The artisan's right index finger traces a line on the Directory. With their left hand, they hold open a smaller, narrower technical scroll — a specific reference document they've pulled from the shelf — comparing its contents to the Directory entry. Two other scrolls sit rolled beside them on the desk, pulled and waiting to be read next. LIGHTING: Six oil lamps in iron wall brackets are spaced evenly around the room, casting overlapping pools of warm amber light that leave no area in darkness but create gentle shadowing between the shelf sections. One lamp hangs directly above the reading desk on a chain, providing brighter focused light on the Directory. The stone ceiling dome catches the lamplight and reflects it softly downward. The atmosphere is quiet, warm, and studious — a library that is actively used, not a dusty museum. Style: detailed fantasy illustration in the tradition of illustrated encyclopedias. Warm ochre and honey tones from the lamplight, cool grey-blue stone in the shadows. Rich texture on the scroll surfaces and stone shelving. The carved section labels should be legible. 16:9 aspect ratio."
+/>
+
+### Versioning
+
+Every update creates a new version. The previous version is snapshotted to a `document_versions` table before the update is applied. You can view the full history with `sf document history <id>`, view a specific version with `sf document show <id> --doc-version 2`, or roll back by creating a new version with old content. Rollback doesn't erase history. It creates version N+1 with the old content.
+
+### Libraries
+
+Documents are organized into libraries via parent-child dependencies. A library can contain documents and sub-libraries, forming a tree. Documents can belong to multiple libraries. Libraries support hierarchical nesting (with cycle detection to prevent circular containment), and the system can resolve a document's full library path: `documentation/api-reference/authentication`.
+
+### Search
+
+Two search modes are available.
+
+**Full-text search** uses SQLite's FTS5 engine with Porter stemming and Unicode support. Queries are sanitized by splitting into tokens and wrapping each in double quotes to prevent FTS5 operator interpretation. Results are ranked by BM25 relevance score. An adaptive top-K filter uses elbow detection on score gaps to find the natural quality cutoff.
+
+**Semantic search** is optional and uses vector embeddings stored as Float32Array blobs. When both modes are available, a hybrid search combines rankings using Reciprocal Rank Fusion (RRF) with a smoothing constant of k=60.
+
+### The descriptionRef pattern
+
+Tasks don't store their descriptions inline. They reference a Document via `descriptionRef`. This lets descriptions be rich (markdown, arbitrary length), versioned independently from the task, and searchable through full-text search. When a worker hands off, the handoff notes are appended to this description Document so the next worker gets the accumulated context.
+
+Messages use the same pattern via `contentRef`, and libraries can have descriptions via `descriptionRef`. The pattern keeps metadata tables lean while supporting arbitrarily complex content.
+
+## External sync
+
+Stoneforge can sync data bidirectionally with external systems. Four providers are supported: GitHub (issues and PRs), Linear (issues), Notion (documents as pages), and folder (documents as markdown files on disk).
+
+Each sync-enabled element stores its external link in `metadata._externalSync`, including the provider, project, external ID, and content hashes from the last push and pull. Change detection compares current content hashes against stored hashes to determine what needs syncing.
+
+The sync engine supports push, pull, and bidirectional modes. Conflict resolution is configurable: last-write-wins (default), local-wins, remote-wins, or manual (tags the element with `external-sync-conflict` for human resolution).
+
+Not everything syncs. System-category documents (`task-description` and `message-content`) are excluded automatically. Documents without titles are excluded to prevent untitled stubs from overwriting real content in external systems.
+
+## Workflows and playbooks
+
+For multi-step processes that need to execute in order with durable state, Stoneforge provides workflows and playbooks.
+
+A **playbook** is a reusable template. It defines a sequence of steps (task steps or function steps), template variables with types and defaults, and optional conditions that include or exclude steps based on variable values. Playbooks support inheritance: a playbook can extend another, combining their steps and variables.
+
+A **workflow** is a runtime instance of a playbook. When you instantiate one, Stoneforge resolves inheritance, validates and fills variables, evaluates step conditions, creates Task elements for each included step, wires blocking dependencies between steps based on `dependsOn` declarations, and creates parent-child dependencies linking all steps to the workflow.
+
+Workflows can be ephemeral (for one-off or test runs, not persisted to JSONL) or durable (fully event-sourced). The status lifecycle is: pending → running → completed or failed or cancelled.
+
+**Function steps** can execute TypeScript, Python, or shell commands with configurable timeouts. Task steps are regular Stoneforge tasks dispatched to workers. Because dependencies between steps are expressed as blocking dependencies, the normal dispatch system handles ordering: step 2 won't start until step 1 closes.
+
+If a step fails, the workflow's state is preserved. You can fix the issue, reopen the failed task, and the workflow resumes from that step. This is the "durable state" property: the workflow's progress is the aggregate status of its child tasks, not a separate counter that can drift out of sync.
+
+## Custom prompts
+
+Each agent role has a built-in system prompt that defines its behavior. The Director prompt explains how to decompose goals into tasks, set priorities, and manage dependencies. The worker prompt explains how to execute tasks, commit, push, and hand off. Steward prompts explain the specific focus area (merge, docs, recovery).
+
+You can override any of these per-project by placing `.md` files in `.stoneforge/prompts/`. The file names match the built-in prompt names: `director.md`, `worker.md`, `persistent-worker.md`, `steward-base.md`, `steward-merge.md`, `steward-docs.md`, `steward-recovery.md`, and `message-triage.md`.
+
+Overrides take full precedence. If you provide a `worker.md`, the built-in worker prompt is replaced entirely. For stewards, you can override the base prompt and focus prompt independently. The system tracks which prompts are built-in and which are project overrides, so you can debug unexpected behavior.
+
+Prompts support template variables. `{{baseBranch}}` is replaced with the detected target branch at render time. This lets prompts reference the correct branch for merge operations without hardcoding `main` or `master`.
+
+## Providers and multi-plan scaling
+
+Stoneforge abstracts the underlying agent CLI through a provider system. Three providers are built in:
+
+**Claude Code** is the default. Headless sessions use the `@anthropic-ai/claude-agent-sdk` for structured message streaming. Interactive sessions spawn a Claude Code CLI process via node-pty for terminal-based output.
+
+**OpenCode** connects through an HTTP server using `@opencode-ai/sdk` for headless sessions and the OpenCode CLI for interactive sessions.
+
+**OpenAI Codex** uses a JSON-RPC protocol over stdio for headless sessions and the Codex CLI for interactive sessions.
+
+Each provider handles its own authentication. You don't configure API keys in Stoneforge. Claude Code uses `~/.claude/`, OpenCode uses its own config directory, and Codex uses whatever OpenAI authentication is configured. Stoneforge doesn't need to know or store credentials.
+
+The provider is set per-agent at registration (`--provider opencode`) or per-session at start. You can mix providers within the same orchestration: a Director running on Claude Code, workers on Codex, stewards on OpenCode. The dispatch system doesn't care which provider an agent uses.
+
+<ImagePlaceholder
+  alt="The Provider's Compact — three artisans from different traditions working side by side, distinct tools but shared infrastructure and compatible output"
+  prompt="Three artisans from three distinct guild traditions working at adjacent benches in the same stoneforge, viewed from a slightly elevated angle that shows all three workstations and the shared output area between them. ARTISAN ONE (left bench): Represents the oldest, most established tradition. Wears a deep indigo robe over their apron, with ornate silver clasps at the collar — a guild uniform with visible heritage. Their technique uses a precision pressing mould: they're forcing heated stone into an intricately carved iron mould form, squeezing the handles of a large lever press. Their tools are heavy, refined, made of dark oiled steel. A small guild emblem — a stylized eye inside a diamond — is stamped into the leather of their apron. ARTISAN TWO (center bench): Represents a newer, more experimental tradition. Wears a simple, modern-looking canvas work shirt with rolled sleeves, no robe. Their technique uses a shaping frame: a lightweight wooden armature with adjustable guide rails that they slide along the surface of heated stone to produce consistent curves. It's a faster, more mechanical approach. Their tools are lighter — brass and pale wood — arranged in modular kits. Their guild emblem is geometric: three interlocking circles on a chest patch. ARTISAN THREE (right bench): Represents a tradition that favors direct craft. Wears a worn, unadorned leather apron over bare arms — no guild insignia visible, just experience written in the calluses and burn marks on their forearms. They work freehand: both hands directly on the heated stone (wearing thick heat-resistant gloves), bending and shaping it by feel and eye against a hand-drawn chalk template on their bench surface. Their tools are minimal — a few hand shapers, a mallet, and intuition. THE SHARED INFRASTRUCTURE: All three benches are structurally identical — same stone-slab surfaces, same iron legs, same dimensions. All three personal forges are the same design: brick kilns with standard bellows. The wall behind all three has the same record-keeping carvings — the shared quarry ledger. Between the three benches and the viewer, a shared output rack holds finished pieces from all three artisans. The pieces are the same general type (curved wall sections) and they fit together perfectly despite being produced by three completely different methods. Two pieces already sit flush against each other on the rack with no visible gap at the seam. A third piece from the freehand artisan is being placed alongside them by a workshop attendant, about to prove its compatibility. The visual story: different methods, different traditions, identical output standard. Style: detailed fantasy illustration, warm forge lighting from the three individual kilns creating overlapping orange pools. The three artisans should feel like real individuals from different cultures, not costumes on mannequins. Rich textile and material textures. 16:9 aspect ratio. No text."
+/>
+
+### Multi-plan scaling
+
+If you're running 10+ agents, you'll hit rate limits on a single Claude MAX or Pro plan. Stoneforge supports splitting agents across multiple plans through the executable path system.
+
+Each agent can specify a custom `executablePath` that points to a wrapper script. The wrapper sets `CLAUDE_CONFIG_DIR` to a plan-specific directory and calls the real Claude CLI. You create one wrapper per plan, authenticate each one separately, and register different workers with different executable paths.
+
+```bash
+#!/bin/bash
+# ~/.stoneforge/claude-plan-2.sh
+export CLAUDE_CONFIG_DIR=~/.claude-plan-2
+exec /usr/local/bin/claude "$@"
+```
+
+Register workers with `--executable-path ~/.stoneforge/claude-plan-2.sh`. The dispatch daemon routes tasks to workers regardless of which plan they're on. If one plan's workers are rate-limited, other plans' workers keep going.
+
+## The dashboard
+
+Everything described above is observable through the web dashboard at `http://localhost:3457`.
+
+<ImagePlaceholder
+  alt="The Director's chamber — overlooking the workshop floor, status crystals on the desk, a network of speaking stones on the wall"
+  prompt="The Director's chamber, a stone room built into the upper wall of the forge cavern, viewed from inside the chamber looking outward. The back wall of the chamber has a wide arched window — roughly 10 feet across and 6 feet tall, with no glass — that opens directly onto the main workshop floor below. Through this window, the full forge is visible one story down: five workbenches arranged on the cavern floor, three with artisans actively working heated stone (visible as small figures, their forges glowing orange), two benches empty and idle (forges dimmed). The view through the window gives the Director full visual awareness of the entire operation without being on the floor. THE DESK: In the foreground, the Director's stone desk runs along the window ledge, positioned so the Director can look up from their work and see the entire floor. On the desk surface, a grid of status crystals is set into carved recesses — 12 crystals arranged in a 4x3 matrix. Each crystal is a polished stone sphere about the size of a golf ball. Five glow a steady green (active agents). Three pulse with amber light (tasks in progress). Two are a cool blue (tasks in review). Two are dark and inert (idle slots). Beside the crystal grid, a stack of parchment pages (plans and reports), an inkwell with a quill, and a small brass bell for summoning attendants. THE COMMUNICATION WALL: The left wall of the chamber holds the speaking stone network — a physical map of the forge's communication topology. Fifteen small orbs, each about the size of a marble, are mounted in iron cradles on the wall. Some orbs glow warm (active connections), others are dim (quiet channels). Thin copper wire physically connects certain orbs to each other, forming a visible graph. A cluster of four orbs at the center represents a group channel — they're connected to each other and to several outlying orbs. Two orbs at the edges are connected only to each other — private direct channels. One orb at the top, larger than the rest and glowing brightest, represents the Director's own channel. THE DIRECTOR: Sits at the desk in a high-backed stone chair, viewed from behind and slightly to the right so we see their profile and the window beyond. They are not looking at any single artisan — their gaze is on the crystal grid, one hand resting on the desk near the amber-pulsing crystals. Their posture is attentive but relaxed. They wear the slate-grey Director's coat (no apron, no forge dust). A small scroll is unfurled in front of them — the current plan. LIGHTING: The chamber is lit primarily by the forge glow rising from the workshop floor through the window, painting the ceiling and far wall with warm, flickering orange. A single candle on the desk provides close reading light. The speaking stone orbs contribute their own scattered points of light across the left wall. Style: detailed fantasy illustration with a cinematic depth-of-field effect — the desk and crystals in sharp foreground focus, the workshop floor through the window slightly soft but fully readable. The composition emphasizes the Director's elevated overview position. Warm, layered lighting — candle yellow on the desk, forge orange through the window, scattered orb-light on the wall. 16:9 aspect ratio. No text."
+/>
+
+The sidebar groups pages by function. **Overview** has Activity (live agent output), Inbox (messages needing attention), and Editor (in-browser code editor with Monaco and LSP support). **Work** has Tasks (list and kanban views), Merge Requests (review queue), Plans (grouped tasks with progress tracking), and Workflows (durable step sequences). **Orchestration** has Agents (register, start, stop, pools, topology graph) and Workspaces (tmux-like terminal multiplexer with saved layouts). **Collaborate** has Messages (channels) and Documents (knowledge base with search). **Analytics** has Metrics (throughput, efficiency, queue health).
+
+The **Director Panel** is always available in the right sidebar. It's an interactive terminal for your Director. You can start, stop, and resume Director sessions and see the unread inbox count.
+
+The dashboard connects to the server via WebSocket. The event broadcaster polls the database every 500ms and pushes updates to connected clients. Dashboard updates have up to half a second of latency, but for a system where tasks take minutes, the delay is imperceptible.
+
+## The identity system
+
+Stoneforge supports three identity modes. **Soft mode** (the default) is name-based with no cryptographic verification. You set an actor name and go. **Cryptographic mode** requires Ed25519 signatures on every mutation. Entities register with public keys, and each request includes a signature, timestamp, and request hash. The server verifies the signature against the stored public key and checks that the timestamp is within a tolerance window (default 5 minutes). **Hybrid mode** accepts both signed and unsigned requests.
+
+For most single-developer setups, soft mode is fine. Cryptographic mode is there for environments where you need to prove which entity made which change, or prevent agents from impersonating each other.
+
+## Setting it up
+
+```bash
+npm install -g @stoneforge/smithy
+cd your-project
+sf init
+sf serve
+```
+
+Open `http://localhost:3457`. Register a Director from the Agents page. Start the Director, give it your goal through the Director Panel. Register a few ephemeral workers and a merge steward. Start the dispatch daemon with `sf daemon start`.
+
+The Director creates a plan. The daemon assigns tasks. Workers execute in isolated worktrees. Stewards merge the results. You watch from the dashboard.
+
+## Tradeoffs
+
+**Polling, not pub/sub.** The dispatch daemon polls every 5 seconds instead of using a message queue or event stream. This adds up to 5 seconds of latency between a task becoming ready and a worker picking it up. Polling is simpler to implement, debug, and operate. For a system where tasks take minutes to hours, 5 seconds of dispatch latency doesn't matter. The interval is configurable down to 1 second.
+
+**SQLite, not Postgres.** The entire data layer runs on SQLite. Everything is local, there's no database server to manage, and the system works offline. The tradeoff is that you can't run multiple Stoneforge instances against the same data. For a tool designed to run on a single developer machine, that's acceptable.
+
+**Worktrees, not containers.** We considered running each worker in a Docker container for stronger isolation. Worktrees are faster to create (milliseconds vs. seconds), share the same `node_modules` and build cache, and don't require Docker. The isolation is at the git level, which is sufficient for the conflicts we're preventing.
+
+**No approval gates.** Stoneforge spawns agents with permissions bypassed. No confirmation dialogs. If you're running five agents in parallel and each one needs approval for every file write, you've built a sequential system with extra steps. The mitigation is code review at the merge steward level, not permission prompts at the agent level.
+
+**Immutable messages, mutable tasks.** Messages can't be edited or deleted. Tasks can be updated freely. Messages are an audit trail of communication. Tasks are living artifacts whose status, priority, and description change throughout their lifecycle.
+
+**Event sourcing overhead.** Recording every mutation as an immutable record means the events table grows indefinitely. No archival or pruning exists yet. Complete auditability at the cost of ever-growing storage. For a single-developer tool, storage growth is slow enough that it's not a practical concern yet.
+
+## What's next
+
+Stoneforge is under active development. We ship weekly. The best way to follow along is to [star the repo](https://github.com/stoneforge-ai/stoneforge), subscribe to the [RSS feed](/rss.xml), or join the [Discord](https://discord.gg/NBCaUUv8Vm).
