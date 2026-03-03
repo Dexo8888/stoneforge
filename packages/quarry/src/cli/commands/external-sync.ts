@@ -24,6 +24,7 @@ import type { Task, Document, ElementId, ExternalProvider, ExternalSyncState, Sy
 import { taskToExternalTask, getFieldMapConfigForProvider } from '../../external-sync/adapters/task-sync-adapter.js';
 import { isSyncableDocument, documentToExternalDocumentInput, resolveDocumentLibraryPath, resolveDocumentLibraryPaths } from '../../external-sync/adapters/document-sync-adapter.js';
 import type { LibraryPathAPI } from '../../external-sync/adapters/document-sync-adapter.js';
+import { createProgressBar, nullProgressBar } from '../utils/progress.js';
 
 /**
  * Providers that do not require an authentication token.
@@ -1013,7 +1014,20 @@ async function pushHandler(
   // Build push options
   const adapterTypes = parseTypeFlag(options.type);
   const mode = getOutputMode(options);
-  const syncPushOptions: { taskIds?: string[]; all?: boolean; force?: boolean; adapterTypes?: SyncAdapterType[]; includeNoLibrary?: boolean; onBeforeProcess?: (count: number) => void } = {};
+
+  // Progress bar — created lazily once total is known (via onProgress callback)
+  let pushProgress = nullProgressBar;
+  const onProgress = mode === 'json' || mode === 'quiet'
+    ? undefined
+    : (current: number, total: number) => {
+        if (current === 0 && total > 0) {
+          // First call — create the progress bar now that we know the total
+          pushProgress = createProgressBar(total, 'Pushing');
+        }
+        pushProgress.update(current);
+      };
+
+  const syncPushOptions: { taskIds?: string[]; all?: boolean; force?: boolean; adapterTypes?: SyncAdapterType[]; includeNoLibrary?: boolean; onBeforeProcess?: (count: number) => void; onProgress?: (current: number, total: number) => void } = {};
   if (adapterTypes) {
     syncPushOptions.adapterTypes = adapterTypes;
   }
@@ -1033,6 +1047,9 @@ async function pushHandler(
   if (options['no-library']) {
     syncPushOptions.includeNoLibrary = true;
   }
+  if (onProgress) {
+    syncPushOptions.onProgress = onProgress;
+  }
 
   // Show warning for large element sets before processing begins
   if (mode !== 'json' && mode !== 'quiet') {
@@ -1048,6 +1065,7 @@ async function pushHandler(
 
   try {
     const result = await engine.push(syncPushOptions);
+    pushProgress.finish();
 
     const output: Record<string, unknown> = {
       success: result.success,
@@ -1100,6 +1118,7 @@ async function pushHandler(
 
     return success(output, lines.join('\n'));
   } catch (err) {
+    pushProgress.finish();
     const message = err instanceof Error ? err.message : String(err);
     return failure(`Push failed: ${message}`, ExitCode.GENERAL_ERROR);
   }
@@ -2266,11 +2285,17 @@ async function linkAllDocumentsHandler(
     progressLines.push('');
   }
 
+  // Progress bar — only in default/verbose human-readable output mode
+  const progress = mode === 'json' || mode === 'quiet'
+    ? nullProgressBar
+    : createProgressBar(docsToLink.length, 'Linking documents');
+
   // Process documents in batches
   let totalSucceeded = 0;
   let totalFailed = 0;
   let rateLimited = false;
   let rateLimitResetAt: number | undefined;
+  let completed = 0;
 
   for (let i = 0; i < docsToLink.length; i += batchSize) {
     const batch = docsToLink.slice(i, i + batchSize);
@@ -2287,6 +2312,8 @@ async function linkAllDocumentsHandler(
 
     totalSucceeded += batchResult.succeeded;
     totalFailed += batchResult.failed;
+    completed += batch.length;
+    progress.update(completed);
 
     if (batchResult.rateLimited) {
       rateLimited = true;
@@ -2298,6 +2325,8 @@ async function linkAllDocumentsHandler(
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
+
+  progress.finish();
 
   const skipped = docsToLink.length - totalSucceeded - totalFailed;
 
@@ -2553,11 +2582,17 @@ async function linkAllHandler(
     progressLines.push('');
   }
 
+  // Progress bar — only in default/verbose human-readable output mode
+  const progress = mode === 'json' || mode === 'quiet'
+    ? nullProgressBar
+    : createProgressBar(tasksToLink.length, 'Linking tasks');
+
   // Process tasks in batches
   let totalSucceeded = 0;
   let totalFailed = 0;
   let rateLimited = false;
   let rateLimitResetAt: number | undefined;
+  let completed = 0;
 
   for (let i = 0; i < tasksToLink.length; i += batchSize) {
     const batch = tasksToLink.slice(i, i + batchSize);
@@ -2574,6 +2609,8 @@ async function linkAllHandler(
 
     totalSucceeded += batchResult.succeeded;
     totalFailed += batchResult.failed;
+    completed += batch.length;
+    progress.update(completed);
 
     if (batchResult.rateLimited) {
       rateLimited = true;
@@ -2586,6 +2623,8 @@ async function linkAllHandler(
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
+
+  progress.finish();
 
   const skipped = tasksToLink.length - totalSucceeded - totalFailed;
 
