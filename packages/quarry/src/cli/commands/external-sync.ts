@@ -32,6 +32,13 @@ import type { LibraryPathAPI } from '../../external-sync/adapters/document-sync-
  */
 const TOKENLESS_PROVIDERS = new Set(['folder']);
 
+/**
+ * Threshold for showing a warning when operating on a large set of elements.
+ * Operations targeting more than this number of elements will display a
+ * warning to inform the user the operation may take a significant amount of time.
+ */
+const LARGE_SET_WARNING_THRESHOLD = 100;
+
 // ============================================================================
 // Type Flag Helper
 // ============================================================================
@@ -1005,7 +1012,8 @@ async function pushHandler(
 
   // Build push options
   const adapterTypes = parseTypeFlag(options.type);
-  const syncPushOptions: { taskIds?: string[]; all?: boolean; force?: boolean; adapterTypes?: SyncAdapterType[]; includeNoLibrary?: boolean } = {};
+  const mode = getOutputMode(options);
+  const syncPushOptions: { taskIds?: string[]; all?: boolean; force?: boolean; adapterTypes?: SyncAdapterType[]; includeNoLibrary?: boolean; onBeforeProcess?: (count: number) => void } = {};
   if (adapterTypes) {
     syncPushOptions.adapterTypes = adapterTypes;
   }
@@ -1026,10 +1034,21 @@ async function pushHandler(
     syncPushOptions.includeNoLibrary = true;
   }
 
+  // Show warning for large element sets before processing begins
+  if (mode !== 'json' && mode !== 'quiet') {
+    syncPushOptions.onBeforeProcess = (count: number) => {
+      if (count > LARGE_SET_WARNING_THRESHOLD) {
+        process.stderr.write(
+          `\nWarning: About to push ${count} elements. ` +
+          `This may take a significant amount of time for large element sets.\n\n`
+        );
+      }
+    };
+  }
+
   try {
     const result = await engine.push(syncPushOptions);
 
-    const mode = getOutputMode(options);
     const output: Record<string, unknown> = {
       success: result.success,
       pushed: result.pushed,
@@ -2203,6 +2222,14 @@ async function linkAllDocumentsHandler(
     return success(jsonResult, lines.join('\n'));
   }
 
+  // Warn about large element sets (skip for json/quiet — already handled above)
+  if (docsToLink.length > LARGE_SET_WARNING_THRESHOLD && mode !== 'json' && mode !== 'quiet') {
+    process.stderr.write(
+      `\nWarning: About to link ${docsToLink.length} documents. ` +
+      `This may take a significant amount of time for large document sets.\n\n`
+    );
+  }
+
   // Create provider for actual linking (supports DI for testing)
   const providerFactory = options._providerFactory ?? createProviderFromSettings;
   const {
@@ -2480,6 +2507,14 @@ async function linkAllHandler(
     }
 
     return success(jsonResult, lines.join('\n'));
+  }
+
+  // Warn about large element sets (skip for json/quiet — already handled above)
+  if (tasksToLink.length > LARGE_SET_WARNING_THRESHOLD && mode !== 'json' && mode !== 'quiet') {
+    process.stderr.write(
+      `\nWarning: About to link ${tasksToLink.length} tasks. ` +
+      `This may take a significant amount of time for large task sets.\n\n`
+    );
   }
 
   // Create provider for actual linking (supports DI for testing)

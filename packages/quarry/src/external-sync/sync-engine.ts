@@ -92,6 +92,11 @@ export interface SyncOptions {
    * Set to true to include them.
    */
   readonly includeNoLibrary?: boolean;
+  /**
+   * Callback invoked with the total element count before processing begins.
+   * Useful for showing progress information or warnings about large sets.
+   */
+  readonly onBeforeProcess?: (count: number) => void;
 }
 
 /**
@@ -301,6 +306,9 @@ export class SyncEngine {
       });
       noLibrarySkipped = beforeCount - elements.length;
     }
+
+    // Notify caller of total count before processing begins
+    options.onBeforeProcess?.(elements.length);
 
     // Step 2: Process elements concurrently in batches
     for (let i = 0; i < elements.length; i += PUSH_CONCURRENCY) {
