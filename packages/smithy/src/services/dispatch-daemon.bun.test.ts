@@ -1928,14 +1928,19 @@ describe('DispatchDaemon Rate Limit Integration', () => {
     expect(status.isPaused).toBe(true);
   });
 
-  test('handleRateLimitDetected does NOT mark chain entries for executable not in chain', () => {
-    // An executable not in the fallback chain should only mark itself
+  test('handleRateLimitDetected marks ALL chain entries even for executable not in chain', () => {
+    // When a fallback chain is configured, any rate limit event should mark all
+    // chain entries (plan-level rate limits share the same API plan). The reported
+    // executable may be a resolved path that doesn't match chain entry names.
     const resetsAt = new Date(Date.now() + 20 * 60 * 1000);
     daemon.handleRateLimitDetected('some-other-executable', resetsAt);
 
     const status = daemon.getRateLimitStatus();
-    expect(status.limits).toHaveLength(1);
-    expect(status.limits[0]!.executable).toBe('some-other-executable');
+    // All chain entries + the raw executable should be marked
+    expect(status.limits).toHaveLength(3); // 'claude2', 'claude', 'some-other-executable'
+    const executables = status.limits.map(l => l.executable).sort();
+    expect(executables).toEqual(['claude', 'claude2', 'some-other-executable']);
+    expect(status.isPaused).toBe(true);
   });
 
   // --------------------------------------------------------------------------
@@ -3525,6 +3530,84 @@ describe('runPollCycle - allLimited with empty fallback chain', () => {
   test('reports not paused when default provider is not rate-limited with empty fallback chain', () => {
     const status = daemon.getRateLimitStatus();
     expect(status.isPaused).toBe(false);
+  });
+
+  test('reports isPaused when custom executable path is rate-limited with empty fallback chain', () => {
+    // Configure a custom executable path for the claude-code provider.
+    // When the rate limit is recorded against this custom path (not the string 'claude'),
+    // getRateLimitStatus() should still report isPaused: true.
+    const customDaemon = new DispatchDaemonImpl(
+      api,
+      agentRegistry,
+      sessionManager,
+      dispatchService,
+      worktreeManager,
+      taskAssignment,
+      stewardScheduler,
+      inboxService,
+      {
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: true,
+        inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: true,
+      },
+      undefined,
+      createMockSettingsService({
+        fallbackChain: [],
+        defaultExecutablePaths: { 'claude-code': '/custom/claude' },
+      })
+    );
+
+    // Rate limit recorded against the custom executable path
+    customDaemon.handleRateLimitDetected('/custom/claude', new Date(Date.now() + 60_000));
+
+    const status = customDaemon.getRateLimitStatus();
+    expect(status.isPaused).toBe(true);
+    expect(status.limits).toHaveLength(1);
+    expect(status.limits[0].executable).toBe('/custom/claude');
+
+    // Cleanup
+    customDaemon.stop();
+  });
+
+  test('reports isPaused when rate limit key differs from fallback chain entry names', () => {
+    // When a rate_limited event reports a resolved path (e.g., '/usr/local/bin/claude')
+    // that doesn't match fallback chain entry names, handleRateLimitDetected should
+    // still mark all chain entries as limited.
+    const chainDaemon = new DispatchDaemonImpl(
+      api,
+      agentRegistry,
+      sessionManager,
+      dispatchService,
+      worktreeManager,
+      taskAssignment,
+      stewardScheduler,
+      inboxService,
+      {
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: true,
+        inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+      },
+      undefined,
+      createMockSettingsService({
+        fallbackChain: ['claude2', 'claude'],
+      })
+    );
+
+    // Rate limit reported with a resolved path that doesn't match chain entry names
+    chainDaemon.handleRateLimitDetected('/usr/local/bin/claude', new Date(Date.now() + 60_000));
+
+    const status = chainDaemon.getRateLimitStatus();
+    // All chain entries should be marked as limited (plan-level rate limit)
+    expect(status.isPaused).toBe(true);
+    expect(status.limits.length).toBeGreaterThanOrEqual(2);
+
+    // Cleanup
+    chainDaemon.stop();
   });
 });
 

@@ -683,9 +683,19 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     // prevent resolveExecutableWithFallback() from thinking other executables
     // in the chain are still available.
     const fallbackChain = this.settingsService?.getAgentDefaults().fallbackChain ?? [];
-    if (fallbackChain.length > 0 && fallbackChain.includes(executable)) {
+    if (fallbackChain.length > 0) {
+      // Plan-level rate limits: hitting a limit on any executable means the
+      // entire API plan is limited. Mark every chain entry regardless of whether
+      // the reported executable exactly matches a chain entry name (the session
+      // may report a resolved path like '/usr/local/bin/claude' rather than the
+      // chain entry name 'claude').
       for (const chainExecutable of fallbackChain) {
         this.rateLimitTracker.markLimited(chainExecutable, effectiveResetsAt);
+      }
+      // Also mark the raw executable path if it differs from chain entry names,
+      // so that direct isLimited() checks against the raw path also return true.
+      if (!fallbackChain.includes(executable)) {
+        this.rateLimitTracker.markLimited(executable, effectiveResetsAt);
       }
       logger.info(
         `Rate limit detected for executable '${executable}', marked all ${fallbackChain.length} fallback chain entries as limited until ${effectiveResetsAt.toISOString()}`
@@ -705,10 +715,10 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     soonestReset?: string;
   } {
     const fallbackChain = this.settingsService?.getAgentDefaults().fallbackChain ?? [];
+    const allLimits = this.rateLimitTracker.getAllLimits();
     const isPaused = fallbackChain.length > 0
       ? this.rateLimitTracker.isAllLimited(fallbackChain)
-      : this.rateLimitTracker.isLimited('claude');
-    const allLimits = this.rateLimitTracker.getAllLimits();
+      : allLimits.length > 0;
     const soonestReset = this.rateLimitTracker.getSoonestResetTime();
 
     return {
@@ -1813,7 +1823,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       const fallbackChain = this.settingsService?.getAgentDefaults().fallbackChain ?? [];
       const allLimited = fallbackChain.length > 0
         ? this.rateLimitTracker.isAllLimited(fallbackChain)
-        : this.rateLimitTracker.isLimited('claude');
+        : this.rateLimitTracker.getAllLimits().length > 0;
 
       if (allLimited) {
         // Schedule a wake-up timer so we re-check when the soonest limit expires
