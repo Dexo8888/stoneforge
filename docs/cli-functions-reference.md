@@ -125,7 +125,7 @@ Drops and reinitializes the database. With `--full`, deletes everything and rein
 | `--title <text>` | `-t` | New title |
 | `--priority <1-5>` | `-p` | New priority (tasks only) |
 | `--complexity <1-5>` | `-c` | New complexity (tasks only) |
-| `--status <status>` | `-s` | New status (tasks: open, in_progress, review, backlog, deferred, closed) |
+| `--status <status>` | `-s` | New status (tasks: open, in_progress, blocked, deferred, backlog, review, closed, tombstone) |
 | `--assignee <id>` | `-a` | New assignee (empty string to unassign) |
 | `--description <text>` | `-d` | Update description |
 | `--metadata <json>` | | JSON metadata to merge (null values remove keys) |
