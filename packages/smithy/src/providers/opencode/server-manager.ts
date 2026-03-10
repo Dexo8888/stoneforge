@@ -281,6 +281,7 @@ class OpenCodeServerManager {
     const proc = spawn('opencode', args, {
       cwd: config?.cwd, // THE KEY FIX: set the process working directory
       env, // Pass our full env directly — no process.env mutation needed
+      shell: true, // Required for Windows: enables PATH lookup via cmd.exe (uses /bin/sh on Unix)
     });
 
     // Parse server URL from stdout (same logic as SDK's createOpencodeServer)
