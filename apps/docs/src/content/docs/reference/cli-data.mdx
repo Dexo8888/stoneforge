@@ -420,7 +420,7 @@ sf team delete <id> [--reason <text>] [--force]
 sf playbook list [--limit <n>]
 sf playbook show <name|id> [--steps] [--variables]
 sf playbook validate <name|id> [--var name=value] [--create]
-sf playbook create -n <name> -t <title> [-s id:title[:deps]] [-v name:type[:default][:required]]
+sf playbook create -n <name> -t <title> [-s id:title[:deps]] [--variable name:type[:default][:required]]
 ```
 
 ```bash
@@ -428,8 +428,8 @@ sf playbook create -n <name> -t <title> [-s id:title[:deps]] [-v name:type[:defa
 sf playbook create -n deploy -t "Deployment Process" \
   -s "build:Build app" \
   -s "test:Run tests:build" \
-  -v "env:string" \
-  -v "debug:boolean:false:false"
+  --variable "env:string" \
+  --variable "debug:boolean:false:false"
 ```
 
 ---

@@ -13,7 +13,7 @@ import TerminalBlock from '../../../components/custom/TerminalBlock.astro';
 Initialize a new Stoneforge workspace in the current directory.
 
 ```bash
-sf init [--name <name>] [--actor <actor>]
+sf init [--name <name>] [--demo] [--actor <actor>]
 ```
 
 Creates a `.stoneforge/` directory containing `config.yaml`, `stoneforge.db`, `.gitignore`, and a `playbooks/` directory. If `.stoneforge/` already exists (e.g. after cloning) but no database is present, it creates the database and auto-imports from existing JSONL sync files.
@@ -74,9 +74,9 @@ Show workspace statistics — element counts by type, ready/blocked tasks, depen
 sf stats [--json]
 ```
 
-### `sf identity whoami`
+### `sf whoami`
 
-Show the current actor identity. This is a subcommand of the `sf identity` command group.
+Show the current actor identity. Also available as `sf identity whoami`.
 
 ### `sf completion`
 
@@ -141,6 +141,7 @@ sf create <type> [options]
 | Option | Description |
 | --- | --- |
 | `-t, --title <text>` | Title (required for tasks) |
+| `-n, --name <text>` | Alias for `--title` |
 | `-d, --description <text>` | Description (creates a linked document) |
 | `-p, --priority <1-5>` | Priority: 1 = critical, 5 = minimal |
 | `-c, --complexity <1-5>` | Complexity: 1 = trivial, 5 = very complex |
@@ -148,6 +149,7 @@ sf create <type> [options]
 | `-a, --assignee <id>` | Assignee entity ID |
 | `--tag <tag>` | Add tag (repeatable) |
 | `--plan <id\|name>` | Attach to a plan |
+| `--no-auto-link` | Skip auto-linking to external services |
 
 ```bash
 sf create task --title "Fix login bug" --priority 1 --type bug
