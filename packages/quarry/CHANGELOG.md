@@ -1,5 +1,15 @@
 # @stoneforge/quarry
 
+## 1.16.2
+
+### Patch Changes
+
+- b2ce7ce: Fix `sf init --name` flag being a no-op: the `--name` option now correctly sets the workspace name in `config.yaml`
+- a77ec61: Fix `sf update --help` to list all 8 valid task statuses instead of only 4
+  - @stoneforge/core@1.16.2
+  - @stoneforge/storage@1.16.2
+  - @stoneforge/shared-routes@1.16.2
+
 ## 1.16.1
 
 ### Patch Changes
