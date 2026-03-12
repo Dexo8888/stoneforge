@@ -120,6 +120,7 @@ export class WebSocketClient {
   private pingInterval: number;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private debug: boolean;
+  private shouldReconnect: boolean = true;
 
   constructor(options: WebSocketOptions) {
     this.url = options.url;
@@ -174,6 +175,7 @@ export class WebSocketClient {
       return;
     }
 
+    this.shouldReconnect = true;
     this.setState('connecting');
 
     try {
@@ -215,10 +217,12 @@ export class WebSocketClient {
    * Disconnect from the WebSocket server
    */
   disconnect(): void {
+    this.shouldReconnect = false;
     this.stopPingTimer();
     this.cancelReconnect();
 
     if (this.socket) {
+      this.clearSocketHandlers(this.socket);
       this.socket.close(1000, 'Client disconnect');
       this.socket = null;
     }
@@ -362,13 +366,28 @@ export class WebSocketClient {
   }
 
   /**
+   * Clear all event handlers on a socket to allow garbage collection
+   */
+  private clearSocketHandlers(socket: WebSocket): void {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+  }
+
+  /**
    * Handle disconnection
    */
   private handleDisconnect(): void {
     this.stopPingTimer();
-    this.socket = null;
-    this.setState('reconnecting');
-    this.scheduleReconnect();
+    if (this.socket) {
+      this.clearSocketHandlers(this.socket);
+      this.socket = null;
+    }
+    if (this.shouldReconnect) {
+      this.setState('reconnecting');
+      this.scheduleReconnect();
+    }
   }
 
   /**

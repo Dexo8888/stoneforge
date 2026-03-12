@@ -311,4 +311,79 @@ describe('WebSocketClient', () => {
     mockWsInstance?.simulateMessage('not valid json');
     mockWsInstance?.simulateMessage('{}');
   });
+
+  test('disconnect() does not trigger reconnection (memory leak bug)', async () => {
+    let socketCreationCount = 0;
+    (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = class extends MockWebSocket {
+      constructor(url: string) {
+        super(url);
+        socketCreationCount++;
+        mockWsInstance = this;
+      }
+    };
+
+    const client = new WebSocketClient({ url: 'ws://localhost:3456/ws', reconnectDelay: 50 });
+    client.connect();
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(client.isConnected).toBe(true);
+    expect(socketCreationCount).toBe(1);
+
+    client.disconnect();
+    expect(client.connectionState).toBe('disconnected');
+
+    // Wait longer than reconnectDelay to ensure no reconnection occurs
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    expect(client.connectionState).toBe('disconnected');
+    expect(socketCreationCount).toBe(1); // No new socket should be created
+  });
+
+  test('socket handlers are cleared on disconnect to prevent memory leak', async () => {
+    const client = new WebSocketClient({ url: 'ws://localhost:3456/ws' });
+    client.connect();
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(client.isConnected).toBe(true);
+
+    client.disconnect();
+
+    // Socket handlers must be null after disconnect to allow GC
+    expect(mockWsInstance?.onopen).toBeNull();
+    expect(mockWsInstance?.onmessage).toBeNull();
+    expect(mockWsInstance?.onclose).toBeNull();
+    expect(mockWsInstance?.onerror).toBeNull();
+  });
+
+  test('reconnect does not accumulate stale socket handlers', async () => {
+    let createdSockets: MockWebSocket[] = [];
+    (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = class extends MockWebSocket {
+      constructor(url: string) {
+        super(url);
+        createdSockets.push(this);
+        mockWsInstance = this;
+      }
+    };
+
+    const client = new WebSocketClient({ url: 'ws://localhost:3456/ws', reconnectDelay: 50 });
+    client.connect();
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(createdSockets).toHaveLength(1);
+
+    // Simulate unexpected disconnect (not a manual disconnect)
+    createdSockets[0].simulateError();
+
+    // Wait for reconnect
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // A new socket should have been created
+    expect(createdSockets.length).toBeGreaterThanOrEqual(2);
+
+    // The old socket's handlers must be cleared to allow GC
+    expect(createdSockets[0].onopen).toBeNull();
+    expect(createdSockets[0].onmessage).toBeNull();
+    expect(createdSockets[0].onclose).toBeNull();
+    expect(createdSockets[0].onerror).toBeNull();
+  });
 });
